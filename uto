@@ -16,7 +16,7 @@ import zipfile
 BOT_PREFIX = "!"
 CONFIG_FILE = "config.json"
 TOKENS_FILE = "tokens.json"
-OWNER_ID = 1023200522120998922   # GANTI DENGAN ID ANDA
+OWNER_ID = 00   # GANTI DENGAN ID ANDA
 DELAY_MARGIN = 5                 # detik tambahan setelah retry_after
 DEFAULT_DELAY = 1800            # 30 menit
 MAX_ERROR_COUNT = 5            # hapus channel setelah 5x error berturut-turut
