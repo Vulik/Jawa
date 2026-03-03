@@ -1,1069 +1,130 @@
-import discord
-from discord import app_commands, Embed, Colour, ui
-from discord.ext import commands, tasks
-import asyncio
-import json
-import os
-import aiohttp
-import logging
-from datetime import datetime
-from typing import Dict, Optional, List, Tuple
-import pytz
-import io
-import zipfile
+#!/bin/bash
+# ============================================================
+# Script otomatisasi pemeliharaan aplikasi untuk Android (Root)
+# Versi: Mendukung file ZIP yang berisi APK
+# Dependensi: curl, unzip (install di Termux: pkg install curl unzip)
+# ============================================================
 
-# ========== KONFIGURASI ==========
-BOT_PREFIX = "!"
-CONFIG_FILE = "config.json"
-TOKENS_FILE = "tokens.json"
-OWNER_ID = 00   # GANTI DENGAN ID ANDA
-DELAY_MARGIN = 5                 # detik tambahan setelah retry_after
-DEFAULT_DELAY = 1800            # 30 menit
-MAX_ERROR_COUNT = 5            # hapus channel setelah 5x error berturut-turut
-TIMEZONE = "Asia/Jakarta"
+# Pastikan script dijalankan sebagai root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: Script harus dijalankan sebagai root."
+    echo "Gunakan: su -c \"bash $0\""
+    exit 1
+fi
 
-# ========== LOGGING ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('discord_bot.log'),
-        logging.StreamHandler()
-    ]
+# ========== KONFIGURASI (UBAH SESUAI KEBUTUHAN) ==========
+# Daftar package name (harus sesuai dengan yang terinstall di sistem)
+packages=(
+    "com.example.app1"
+    "com.example.app2"
+    "com.example.app3"
 )
-logger = logging.getLogger(__name__)
 
-# ========== LOAD / SAVE CONFIG ==========
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    return {"default_delay": DEFAULT_DELAY}
+# Daftar URL download (bisa langsung APK atau ZIP)
+# Pastikan urutannya sama dengan array packages
+urls=(
+ "https://github.com/Vulik/Jawa/releases/download/Hai/HI.zip"   # ZIP berisi APK
+)
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+# Direktori sementara (harus writable oleh root)
+TEMP_DIR="/data/local/tmp"
+# ============================================================
 
-def load_tokens():
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE, 'r') as f:
-            data = json.load(f)
-            # Migrasi format lama (list of strings) ke objek
-            if "tokens" in data and data["tokens"] and isinstance(data["tokens"][0], str):
-                new_tokens = []
-                for token in data["tokens"]:
-                    new_tokens.append({
-                        "token": token,
-                        "user_id": "unknown",
-                        "username": "Unknown",
-                        "active": False,
-                        "strict": False,
-                        "token_default_message": None,
-                        "channels": [],
-                        "schedule": {
-                            "enabled": False,
-                            "start": "08:00",
-                            "end": "22:00"
-                        },
-                        "added_at": datetime.now().isoformat()
-                    })
-                data["tokens"] = new_tokens
-                save_tokens(data)
-            else:
-                # Migrasi field schedule, strict, stats, consecutive_errors
-                for t in data.get("tokens", []):
-                    if "schedule" not in t:
-                        t["schedule"] = {"enabled": False, "start": "08:00", "end": "22:00"}
-                    if "strict" not in t:
-                        t["strict"] = False
-                    for ch in t.get("channels", []):
-                        if "stats" not in ch:
-                            ch["stats"] = {"messages_sent": 0, "messages_failed": 0}
-                        if "consecutive_errors" not in ch:
-                            ch["consecutive_errors"] = 0
-                save_tokens(data)
-            return data
-    return {"tokens": []}
+# Fungsi untuk membuka aplikasi menggunakan monkey (fallback ke am start)
+open_app() {
+    local pkg="$1"
+    echo "Membuka aplikasi $pkg ..."
+    # Coba dengan monkey (paling sederhana)
+    monkey -p "$pkg" 1 > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Peringatan: Gagal membuka $pkg dengan monkey. Coba metode alternatif..."
+        # Alternatif: buka dengan intent launcher (memerlukan activity utama, mungkin berhasil)
+        am start -p "$pkg" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER > /dev/null 2>&1
+    fi
+}
 
-def save_tokens(tokens_config):
-    with open(TOKENS_FILE, 'w') as f:
-        json.dump(tokens_config, f, indent=2)
+# Pastikan direktori temp ada
+mkdir -p "$TEMP_DIR"
 
-config = load_config()
-tokens_config = load_tokens()
-
-# ========== CHANNEL MANAGER (PER TOKEN) ==========
-class ChannelManager:
-    def __init__(self):
-        self.active_tasks = {}   # key: f"{token_index}:{channel_id}"
-
-    async def send_discord_message(self, token: str, channel_id: str, content: str) -> Tuple[bool, Optional[float]]:
-        """Kirim pesan ke channel. Return: (success, retry_after)"""
-        if not content or not content.strip():
-            logger.warning(f"Empty message, skipping send to {channel_id}")
-            return False, None
-
-        try:
-            headers = {
-                "Authorization": token,
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0"
-            }
-            payload = {"content": content}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"https://discord.com/api/v10/channels/{channel_id}/messages",
-                    headers=headers,
-                    json=payload
-                ) as response:
-                    if response.status == 429:
-                        data = await response.json()
-                        retry_after = data.get("retry_after", 5)
-                        logger.warning(f"Rate limited. Retry after {retry_after}s")
-                        return False, float(retry_after)
-                    if response.status in (200, 201, 204):
-                        logger.info(f"Message sent to {channel_id}")
-                        return True, None
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Failed to send message: {response.status} - {error_text}")
-                        return False, None
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-            return False, None
-
-    async def start_channel_task(self, token_index: int, token_obj: dict, channel_id: str):
-        """Memulai loop pengiriman untuk satu channel"""
-        task_key = f"{token_index}:{channel_id}"
-        if task_key in self.active_tasks:
-            return False
-
-        # Cari data channel
-        channel_data = None
-        for ch in token_obj.get("channels", []):
-            if ch["channel_id"] == channel_id:
-                channel_data = ch
-                break
-        if not channel_data:
-            return False
-
-        delay = channel_data.get("delay", config["default_delay"])
-
-        # Tentukan pesan
-        if token_obj.get("strict", False):
-            message = token_obj.get("token_default_message") or ""
-        else:
-            message = channel_data.get("custom_message") or token_obj.get("token_default_message") or ""
-
-        async def channel_loop():
-            nonlocal delay
-            logger.info(f"Starting loop for token {token_index}, channel {channel_id}")
-            while task_key in self.active_tasks:
-                try:
-                    # Cek apakah pesan kosong
-                    if not message or not message.strip():
-                        logger.warning(f"Message is empty for channel {channel_id}, skipping send")
-                        await asyncio.sleep(delay)
-                        continue
-
-                    success, retry_after = await self.send_discord_message(
-                        token_obj["token"], channel_id, message
-                    )
-
-                    if success:
-                        # Update statistik
-                        channel_data["stats"]["messages_sent"] = channel_data["stats"].get("messages_sent", 0) + 1
-                        channel_data["consecutive_errors"] = 0
-                        channel_data["last_sent"] = datetime.now().isoformat()
-                        save_tokens(tokens_config)
-                        await asyncio.sleep(delay)
-                    else:
-                        # Update statistik gagal
-                        channel_data["stats"]["messages_failed"] = channel_data["stats"].get("messages_failed", 0) + 1
-                        channel_data["consecutive_errors"] = channel_data.get("consecutive_errors", 0) + 1
-                        save_tokens(tokens_config)
-
-                        if retry_after is not None:
-                            # Rate limit – update delay
-                            new_delay = retry_after + DELAY_MARGIN
-                            logger.info(f"Updating delay for channel {channel_id}: {delay} -> {new_delay}s")
-                            channel_data["delay"] = new_delay
-                            save_tokens(tokens_config)
-                            delay = new_delay
-                            await asyncio.sleep(retry_after)
-                        else:
-                            # Error permanen – cek apakah sudah melebihi batas
-                            if channel_data.get("consecutive_errors", 0) >= MAX_ERROR_COUNT:
-                                logger.warning(f"Channel {channel_id} has {MAX_ERROR_COUNT} consecutive errors, auto-removing")
-                                # Hapus channel
-                                token_obj["channels"] = [c for c in token_obj["channels"] if c["channel_id"] != channel_id]
-                                save_tokens(tokens_config)
-                                await self.stop_channel_task(token_index, channel_id, auto=True)
-                                break
-                            else:
-                                # Matikan channel tapi tetap simpan
-                                logger.warning(f"Permanent failure for channel {channel_id}, deactivating")
-                                await self.stop_channel_task(token_index, channel_id, auto=True)
-                                break
-                except Exception as e:
-                    logger.error(f"Error in channel loop {channel_id}: {e}")
-                    await asyncio.sleep(60)
-
-        task = asyncio.create_task(channel_loop())
-        self.active_tasks[task_key] = task
-        channel_data["active"] = True
-        save_tokens(tokens_config)
-        return True
-
-    async def stop_channel_task(self, token_index: int, channel_id: str, auto: bool = False):
-        """Menghentikan loop channel"""
-        task_key = f"{token_index}:{channel_id}"
-        if task_key in self.active_tasks:
-            self.active_tasks[task_key].cancel()
-            try:
-                await self.active_tasks[task_key]
-            except asyncio.CancelledError:
-                pass
-            del self.active_tasks[task_key]
-
-            token_obj = tokens_config["tokens"][token_index]
-            for ch in token_obj.get("channels", []):
-                if ch["channel_id"] == channel_id:
-                    ch["active"] = False
-                    if auto:
-                        ch["last_error"] = datetime.now().isoformat()
-                    save_tokens(tokens_config)
-                    break
-            return True
-        return False
-
-    async def restart_channel_task(self, token_index: int, token_obj: dict, channel_id: str):
-        await self.stop_channel_task(token_index, channel_id)
-        await asyncio.sleep(1)
-        return await self.start_channel_task(token_index, token_obj, channel_id)
-
-    async def start_all_token_channels(self, token_index: int, token_obj: dict):
-        """Mulai semua channel yang tidak memiliki last_error"""
-        for ch in token_obj.get("channels", []):
-            if ch.get("last_error") is None and ch["channel_id"] not in self.active_tasks:
-                ch["active"] = True
-                save_tokens(tokens_config)
-                await self.start_channel_task(token_index, token_obj, ch["channel_id"])
-
-    async def stop_all_token_channels(self, token_index: int, token_obj: dict):
-        """Hentikan semua channel token ini"""
-        for ch in token_obj.get("channels", []):
-            await self.stop_channel_task(token_index, ch["channel_id"])
-
-channel_manager = ChannelManager()
-
-# ========== AUTO-REFRESH DASHBOARD ==========
-class DashboardManager:
-    def __init__(self):
-        self.active_dashboards = {}  # user_id -> (channel_id, message_id, view)
-        self.refresh_task = None
-
-    def add_dashboard(self, user_id: int, channel_id: int, message_id: int, view: ui.View):
-        self.active_dashboards[user_id] = (channel_id, message_id, view)
-        if self.refresh_task is None or self.refresh_task.done():
-            self.refresh_task = asyncio.create_task(self._auto_refresh_loop())
-
-    def remove_dashboard(self, user_id: int):
-        if user_id in self.active_dashboards:
-            del self.active_dashboards[user_id]
-
-    async def _auto_refresh_loop(self):
-        await asyncio.sleep(5)
-        while self.active_dashboards:
-            for user_id, (ch_id, msg_id, view) in list(self.active_dashboards.items()):
-                try:
-                    channel = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
-                    message = await channel.fetch_message(msg_id)
-                    embed = build_main_dashboard_embed()
-                    await message.edit(embed=embed, view=view)
-                except (discord.NotFound, discord.Forbidden):
-                    self.remove_dashboard(user_id)
-                except Exception as e:
-                    logger.error(f"Auto-refresh error for user {user_id}: {e}")
-                    self.remove_dashboard(user_id)
-            await asyncio.sleep(5)
-
-dashboard_manager = DashboardManager()
-
-# ========== SCHEDULED ON/OFF ==========
-@tasks.loop(minutes=1)
-async def check_schedules():
-    """Cek jadwal setiap token dan aktifkan/nonaktifkan otomatis"""
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    current_time = now.strftime("%H:%M")
-
-    for idx, token_obj in enumerate(tokens_config.get("tokens", [])):
-        schedule = token_obj.get("schedule", {})
-        if not schedule.get("enabled"):
-            continue
-        start = schedule.get("start", "08:00")
-        end = schedule.get("end", "22:00")
-
-        should_be_on = False
-        if start <= end:
-            should_be_on = start <= current_time <= end
-        else:  # melewati tengah malam
-            should_be_on = current_time >= start or current_time <= end
-
-        if should_be_on and not token_obj.get("active"):
-            token_obj["active"] = True
-            for ch in token_obj.get("channels", []):
-                if ch.get("last_error") is None:
-                    ch["active"] = True
-            save_tokens(tokens_config)
-            await channel_manager.start_all_token_channels(idx, token_obj)
-            logger.info(f"Schedule turned ON token {token_obj.get('username')}")
-        elif not should_be_on and token_obj.get("active"):
-            token_obj["active"] = False
-            for ch in token_obj.get("channels", []):
-                ch["active"] = False
-            save_tokens(tokens_config)
-            await channel_manager.stop_all_token_channels(idx, token_obj)
-            logger.info(f"Schedule turned OFF token {token_obj.get('username')}")
-
-# ========== INTENTS & BOT ==========
-intents = discord.Intents.default()
-intents.message_content = True
-
-class MyBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("Slash commands synced")
-        check_schedules.start()
-
-bot = MyBot()
-
-# ========== HELPER EMBEDS ==========
-def success_embed(title: str, desc: str = "") -> Embed:
-    return Embed(title=title, description=desc, colour=Colour.green())
-def error_embed(title: str, desc: str = "") -> Embed:
-    return Embed(title=title, description=desc, colour=Colour.red())
-def warning_embed(title: str, desc: str = "") -> Embed:
-    return Embed(title=title, description=desc, colour=Colour.orange())
-def info_embed(title: str, desc: str = "") -> Embed:
-    return Embed(title=title, description=desc, colour=Colour.blue())
-
-# ========== OWNER CHECK ==========
-def owner_only():
-    async def predicate(interaction: discord.Interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message(
-                embed=error_embed("⛔ Akses Ditolak", f"Hanya <@{OWNER_ID}> yang dapat menggunakan perintah ini."),
-                ephemeral=True
-            )
-            return False
-        return True
-    return app_commands.check(predicate)
-
-# ========== FUNGSI BANTU AMBIL INFO TOKEN ==========
-async def fetch_token_info(token: str) -> Tuple[Optional[str], Optional[str]]:
-    """Mengambil user ID dan username dari token"""
-    try:
-        headers = {"Authorization": token, "User-Agent": "Mozilla/5.0"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://discord.com/api/v10/users/@me", headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    user_id = data["id"]
-                    username = data["username"] + "#" + data["discriminator"] if data.get("discriminator") != "0" else data["username"]
-                    return user_id, username
-                else:
-                    return None, None
-    except:
-        return None, None
-
-# ========== DASHBOARD UTAMA ==========
-def build_main_dashboard_embed() -> Embed:
-    embed = Embed(
-        title="📊 Discord Auto Dashboard",
-        description="Daftar token pengirim pesan",
-        colour=Colour.blue()
-    )
-    if not tokens_config["tokens"]:
-        embed.description = "Belum ada token. Gunakan tombol **Add Token**."
-        return embed
-
-    for idx, tok in enumerate(tokens_config["tokens"]):
-        status = "🟢 Online" if tok.get("active", False) else "🔴 Offline"
-        mode = "Strict" if tok.get("strict", False) else "Non‑strict"
-        ch_count = len(tok.get("channels", []))
-        active_ch = sum(1 for ch in tok.get("channels", []) if ch.get("active", False))
-        name = tok.get("username", "Unknown")
-        user_id = tok.get("user_id", "?")
-        owner_mention = f"<@{user_id}>" if user_id != "?" and user_id != "unknown" else "`?`"
-        schedule = tok.get("schedule", {})
-        sched_icon = "⏰" if schedule.get("enabled") else ""
-        embed.add_field(
-            name=f"[ {name} ] {sched_icon}",
-            value=f"Owner: {owner_mention}\nChannels: {active_ch}/{ch_count}\nStatus: {status}\nMode: {mode}",
-            inline=True
-        )
+# Loop berdasarkan indeks array packages
+for i in "${!packages[@]}"; do
+    pkg="${packages[$i]}"
+    url="${urls[$i]}"
     
-    # Footer dengan waktu refresh
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    embed.set_footer(text=f"Auto-refresh setiap 5 detik • Terakhir: {now}")
-    return embed
-
-class MainDashboardView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # persistent view
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message(embed=error_embed("⛔ Owner Only"), ephemeral=True)
-            return False
-        return True
-
-    @ui.button(label="➕ Add Token", style=discord.ButtonStyle.success)
-    async def add_token(self, interaction: discord.Interaction, button: ui.Button):
-        dashboard_manager.remove_dashboard(interaction.user.id)
-        modal = AddTokenModal()
-        await interaction.response.send_modal(modal)
-
-    @ui.button(label="❌ Remove Token", style=discord.ButtonStyle.danger)
-    async def remove_token(self, interaction: discord.Interaction, button: ui.Button):
-        if not tokens_config["tokens"]:
-            await interaction.response.send_message(embed=warning_embed("⚠️ Tidak ada token"), ephemeral=True)
-            return
-        dashboard_manager.remove_dashboard(interaction.user.id)
-        view = RemoveTokenView()
-        embed = info_embed("🗑 Pilih Token yang akan dihapus")
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @ui.button(label="🔍 Select Token", style=discord.ButtonStyle.primary)
-    async def select_token(self, interaction: discord.Interaction, button: ui.Button):
-        if not tokens_config["tokens"]:
-            await interaction.response.send_message(embed=warning_embed("⚠️ Tidak ada token"), ephemeral=True)
-            return
-        dashboard_manager.remove_dashboard(interaction.user.id)
-        view = TokenSelectView()
-        embed = info_embed("🔽 Pilih Token untuk dikelola")
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @ui.button(label="🔴 EMERGENCY STOP", style=discord.ButtonStyle.danger, row=1)
-    async def emergency_stop(self, interaction: discord.Interaction, button: ui.Button):
-        # Hapus dashboard dari auto-refresh sementara
-        dashboard_manager.remove_dashboard(interaction.user.id)
-        await interaction.response.defer(ephemeral=True)
-        
-        # Matikan semua token dan channel
-        for idx, tok in enumerate(tokens_config["tokens"]):
-            tok["active"] = False
-            for ch in tok.get("channels", []):
-                ch["active"] = False
-            await channel_manager.stop_all_token_channels(idx, tok)
-        save_tokens(tokens_config)
-        
-        # Kirim konfirmasi ke user (ephemeral)
-        embed = success_embed("🛑 EMERGENCY STOP", "Semua token dan channel telah dimatikan.")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        
-        # Update dashboard utama jika masih ada
-        if interaction.message:
-            try:
-                await interaction.message.edit(embed=build_main_dashboard_embed(), view=self)
-                # Daftarkan ulang untuk auto-refresh
-                dashboard_manager.add_dashboard(
-                    interaction.user.id,
-                    interaction.channel_id,
-                    interaction.message.id,
-                    self
-                )
-            except (discord.NotFound, discord.HTTPException):
-                # Kirim dashboard baru di channel yang sama
-                channel = interaction.channel
-                new_msg = await channel.send(embed=build_main_dashboard_embed(), view=self)
-                dashboard_manager.add_dashboard(
-                    interaction.user.id,
-                    channel.id,
-                    new_msg.id,
-                    self
-                )
-
-    @ui.button(label="📤 Export Config", style=discord.ButtonStyle.secondary, row=1)
-    async def export_config(self, interaction: discord.Interaction, button: ui.Button):
-        dashboard_manager.remove_dashboard(interaction.user.id)
-        await interaction.response.defer(ephemeral=True)
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            tokens_data = json.dumps(tokens_config, indent=2)
-            zip_file.writestr('tokens.json', tokens_data)
-            config_data = json.dumps(config, indent=2)
-            zip_file.writestr('config.json', config_data)
-        zip_buffer.seek(0)
-        await interaction.followup.send(
-            file=discord.File(zip_buffer, filename='discord_bot_config.zip'),
-            ephemeral=True
-        )
-
-    @ui.button(label="📥 Import Config", style=discord.ButtonStyle.secondary, row=1)
-    async def import_config(self, interaction: discord.Interaction, button: ui.Button):
-        dashboard_manager.remove_dashboard(interaction.user.id)
-        modal = ImportConfigModal()
-        await interaction.response.send_modal(modal)
-
-# ========== MODAL IMPORT CONFIG ==========
-class ImportConfigModal(ui.Modal, title="Import Config"):
-    file = ui.TextInput(
-        label="Upload file ZIP", 
-        placeholder="Kirim file ZIP melalui command terpisah (tidak didukung modal)",
-        required=False,
-        style=discord.TextStyle.short
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        global tokens_config, config
-        await interaction.response.send_message(
-            embed=info_embed("📤 Upload ZIP", "Silakan kirim file **discord_bot_config.zip** di channel ini dalam 60 detik."),
-            ephemeral=True
-        )
-        def check(msg):
-            return msg.author.id == OWNER_ID and msg.attachments and msg.channel.id == interaction.channel_id
-        try:
-            msg = await bot.wait_for('message', timeout=60.0, check=check)
-            attachment = msg.attachments[0]
-            if not attachment.filename.endswith('.zip'):
-                await interaction.followup.send(embed=error_embed("❌ Bukan file ZIP"), ephemeral=True)
-                return
-            zip_data = await attachment.read()
-            with zipfile.ZipFile(io.BytesIO(zip_data), 'r') as zip_file:
-                if 'tokens.json' not in zip_file.namelist() or 'config.json' not in zip_file.namelist():
-                    await interaction.followup.send(embed=error_embed("❌ ZIP harus berisi tokens.json dan config.json"), ephemeral=True)
-                    return
-                with zip_file.open('tokens.json') as f:
-                    new_tokens = json.load(f)
-                with zip_file.open('config.json') as f:
-                    new_config = json.load(f)
-            if "tokens" not in new_tokens or not isinstance(new_tokens["tokens"], list):
-                await interaction.followup.send(embed=error_embed("❌ Format tokens.json tidak valid"), ephemeral=True)
-                return
-            # Hentikan semua task
-            for idx, tok in enumerate(tokens_config["tokens"]):
-                await channel_manager.stop_all_token_channels(idx, tok)
-            tokens_config = new_tokens
-            config = new_config
-            save_tokens(tokens_config)
-            save_config(config)
-            await interaction.followup.send(embed=success_embed("✅ Import berhasil", "Konfigurasi telah diganti."), ephemeral=True)
-        except asyncio.TimeoutError:
-            await interaction.followup.send(embed=error_embed("❌ Timeout"), ephemeral=True)
-
-# ========== MODAL ADD TOKEN ==========
-class AddTokenModal(ui.Modal, title="Tambah Token Baru"):
-    token_input = ui.TextInput(label="Token Discord", placeholder="Masukkan token user/bot", style=discord.TextStyle.short)
-    label_input = ui.TextInput(label="Label (opsional)", placeholder="Misal: Bot A", required=False, style=discord.TextStyle.short)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        token = self.token_input.value.strip()
-        for t in tokens_config["tokens"]:
-            if t["token"] == token:
-                await interaction.followup.send(embed=error_embed("❌ Token sudah terdaftar"), ephemeral=True)
-                return
-
-        user_id, username = await fetch_token_info(token)
-        if not user_id:
-            await interaction.followup.send(embed=error_embed("❌ Token tidak valid"), ephemeral=True)
-            return
-
-        label = self.label_input.value.strip() or username
-        token_obj = {
-            "token": token,
-            "user_id": user_id,
-            "username": label,
-            "active": False,
-            "strict": False,
-            "token_default_message": None,
-            "channels": [],
-            "schedule": {
-                "enabled": False,
-                "start": "08:00",
-                "end": "22:00"
-            },
-            "added_at": datetime.now().isoformat()
-        }
-        tokens_config["tokens"].append(token_obj)
-        save_tokens(tokens_config)
-
-        embed = success_embed("✅ Token Ditambahkan", f"**{label}** (<@{user_id}>)")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-# ========== VIEW HAPUS TOKEN ==========
-class RemoveTokenView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        self.add_item(TokenRemoveSelect())
-
-class TokenRemoveSelect(ui.Select):
-    def __init__(self):
-        options = []
-        for idx, tok in enumerate(tokens_config["tokens"]):
-            label = f"{tok.get('username', 'Unknown')} - {tok.get('user_id', '')[:6]}"
-            options.append(discord.SelectOption(label=label, value=str(idx)))
-        super().__init__(placeholder="Pilih token yang akan dihapus", options=options[:25])
-
-    async def callback(self, interaction: discord.Interaction):
-        idx = int(self.values[0])
-        token_obj = tokens_config["tokens"][idx]
-        await channel_manager.stop_all_token_channels(idx, token_obj)
-        del tokens_config["tokens"][idx]
-        save_tokens(tokens_config)
-        embed = success_embed("🗑 Token dihapus")
-        await interaction.response.edit_message(embed=embed, view=None)
-
-# ========== VIEW PILIH TOKEN ==========
-class TokenSelectView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        self.add_item(TokenSelect())
-
-class TokenSelect(ui.Select):
-    def __init__(self):
-        options = []
-        for idx, tok in enumerate(tokens_config["tokens"]):
-            label = f"{tok.get('username', 'Unknown')} - {tok.get('user_id', '')[:6]}"
-            status = "🟢" if tok.get("active") else "🔴"
-            options.append(discord.SelectOption(label=f"{status} {label}", value=str(idx)))
-        super().__init__(placeholder="Pilih token", options=options[:25])
-
-    async def callback(self, interaction: discord.Interaction):
-        idx = int(self.values[0])
-        token_obj = tokens_config["tokens"][idx]
-        embed = build_token_detail_embed(idx, token_obj)
-        view = TokenDetailView(idx, token_obj)
-        await interaction.response.edit_message(embed=embed, view=view)
-
-def build_token_detail_embed(token_index: int, token_obj: dict) -> Embed:
-    status = "🟢 Online" if token_obj.get("active") else "🔴 Offline"
-    mode = "Strict" if token_obj.get("strict", False) else "Non‑strict"
-    token_default = token_obj.get("token_default_message")
-    token_msg_display = (token_default[:30] + "...") if token_default else "`(kosong)`"
-    user_id = token_obj.get("user_id", "?")
-    owner_mention = f"<@{user_id}>" if user_id != "?" and user_id != "unknown" else "`?`"
-    schedule = token_obj.get("schedule", {})
-    sched_status = "✅" if schedule.get("enabled") else "❌"
-    sched_text = f"{schedule.get('start', '08:00')} - {schedule.get('end', '22:00')}" if schedule.get("enabled") else "Nonaktif"
-
-    embed = Embed(
-        title=f"📋 Detail Token: {token_obj.get('username', 'Unknown')}",
-        colour=Colour.blue()
-    )
-    embed.add_field(name="Owner", value=owner_mention, inline=True)
-    embed.add_field(name="Status", value=status, inline=True)
-    embed.add_field(name="Mode", value=mode, inline=True)
-    embed.add_field(name="Token Msg", value=token_msg_display, inline=True)
-    embed.add_field(name="Jadwal", value=f"{sched_status} {sched_text}", inline=True)
-    embed.add_field(name="Total Channel", value=str(len(token_obj.get("channels", []))), inline=True)
-
-    channels = token_obj.get("channels", [])
-    if channels:
-        ch_list = ""
-        for ch in channels[:10]:
-            active = "🟢" if ch.get("active") else "🔴"
-            ch_mention = f"<#{ch['channel_id']}>"
-            has_error = "⚠️" if ch.get("last_error") else ""
-            custom_icon = "✏️" if not token_obj.get("strict") and ch.get("custom_message") else ""
-            stats = f"📤{ch.get('stats', {}).get('messages_sent', 0)}/❌{ch.get('stats', {}).get('messages_failed', 0)}"
-            ch_list += f"{active} {ch_mention} {has_error}{custom_icon} `{ch.get('delay', '?')}s` {stats}\n"
-        embed.add_field(name="📢 Channel", value=ch_list or "Tidak ada", inline=False)
-    else:
-        embed.add_field(name="📢 Channel", value="Belum ada channel", inline=False)
-    embed.set_footer(text=f"Token index: {token_index}")
-    return embed
-
-# ========== DETAIL TOKEN VIEW ==========
-class TokenDetailView(ui.View):
-    def __init__(self, token_index: int, token_obj: dict):
-        super().__init__(timeout=180)
-        self.token_index = token_index
-        self.token_obj = token_obj
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message(embed=error_embed("⛔ Owner Only"), ephemeral=True)
-            return False
-        return True
-
-    @ui.button(label="🟢 ON / 🔴 OFF", style=discord.ButtonStyle.primary)
-    async def toggle_active(self, interaction: discord.Interaction, button: ui.Button):
-        self.token_obj["active"] = not self.token_obj.get("active", False)
-
-        if self.token_obj["active"]:
-            for ch in self.token_obj.get("channels", []):
-                if ch.get("last_error") is None:
-                    ch["active"] = True
-            save_tokens(tokens_config)
-            await channel_manager.start_all_token_channels(self.token_index, self.token_obj)
-        else:
-            for ch in self.token_obj.get("channels", []):
-                ch["active"] = False
-            save_tokens(tokens_config)
-            await channel_manager.stop_all_token_channels(self.token_index, self.token_obj)
-
-        embed = build_token_detail_embed(self.token_index, self.token_obj)
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except discord.NotFound:
-            await interaction.followup.send(embed=embed, view=self, ephemeral=True)
-
-    @ui.button(label="⚙️ Toggle Mode", style=discord.ButtonStyle.secondary)
-    async def toggle_strict(self, interaction: discord.Interaction, button: ui.Button):
-        self.token_obj["strict"] = not self.token_obj.get("strict", False)
-        save_tokens(tokens_config)
-        if self.token_obj.get("active"):
-            for ch in self.token_obj.get("channels", []):
-                if ch.get("active"):
-                    await channel_manager.restart_channel_task(self.token_index, self.token_obj, ch["channel_id"])
-        embed = build_token_detail_embed(self.token_index, self.token_obj)
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except discord.NotFound:
-            await interaction.followup.send(embed=embed, view=self, ephemeral=True)
-
-    @ui.button(label="✏️ Set Token Message", style=discord.ButtonStyle.secondary)
-    async def set_token_message(self, interaction: discord.Interaction, button: ui.Button):
-        modal = SetTokenMessageModal(self.token_index, self.token_obj)
-        await interaction.response.send_modal(modal)
-
-    @ui.button(label="⏰ Set Jadwal", style=discord.ButtonStyle.secondary)
-    async def set_schedule(self, interaction: discord.Interaction, button: ui.Button):
-        modal = SetScheduleModal(self.token_index, self.token_obj)
-        await interaction.response.send_modal(modal)
-
-    @ui.button(label="➕ Add Channel", style=discord.ButtonStyle.success)
-    async def add_channel(self, interaction: discord.Interaction, button: ui.Button):
-        modal = AddChannelModal(self.token_index, self.token_obj)
-        await interaction.response.send_modal(modal)
-
-    @ui.button(label="❌ Remove Channel", style=discord.ButtonStyle.danger)
-    async def remove_channel(self, interaction: discord.Interaction, button: ui.Button):
-        if not self.token_obj.get("channels"):
-            await interaction.response.send_message(embed=warning_embed("Tidak ada channel"), ephemeral=True)
-            return
-        view = RemoveChannelView(self.token_index, self.token_obj)
-        embed = info_embed("🗑 Pilih channel yang akan dihapus")
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @ui.button(label="✏️ Set Custom Message", style=discord.ButtonStyle.secondary)
-    async def set_custom_message(self, interaction: discord.Interaction, button: ui.Button):
-        if self.token_obj.get("strict", False):
-            await interaction.response.send_message(embed=warning_embed("Token dalam mode Strict. Ubah ke Non‑strict dulu."), ephemeral=True)
-            return
-        if not self.token_obj.get("channels"):
-            await interaction.response.send_message(embed=warning_embed("Tidak ada channel"), ephemeral=True)
-            return
-        view = SelectChannelForMessageView(self.token_index, self.token_obj)
-        embed = info_embed("💬 Pilih channel untuk custom message")
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @ui.button(label="🔄 Reset Errors", style=discord.ButtonStyle.secondary, row=2)
-    async def reset_errors(self, interaction: discord.Interaction, button: ui.Button):
-        for ch in self.token_obj.get("channels", []):
-            ch["last_error"] = None
-            ch["consecutive_errors"] = 0
-            ch["active"] = False
-        save_tokens(tokens_config)
-        embed = build_token_detail_embed(self.token_index, self.token_obj)
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except discord.NotFound:
-            await interaction.followup.send(embed=embed, view=self, ephemeral=True)
-
-    @ui.button(label="◀ Kembali", style=discord.ButtonStyle.gray, row=2)
-    async def back(self, interaction: discord.Interaction, button: ui.Button):
-        embed = build_main_dashboard_embed()
-        view = MainDashboardView()
-        try:
-            await interaction.response.edit_message(embed=embed, view=view)
-            if interaction.message:
-                dashboard_manager.add_dashboard(
-                    interaction.user.id,
-                    interaction.channel_id,
-                    interaction.message.id,
-                    view
-                )
-        except discord.NotFound:
-            channel = interaction.channel
-            new_msg = await channel.send(embed=embed, view=view)
-            dashboard_manager.add_dashboard(
-                interaction.user.id,
-                channel.id,
-                new_msg.id,
-                view
-            )
-
-# ========== MODAL SET TOKEN DEFAULT MESSAGE ==========
-class SetTokenMessageModal(ui.Modal, title="Set Pesan Default Token"):
-    message = ui.TextInput(
-        label="Pesan default untuk token ini", 
-        style=discord.TextStyle.paragraph, 
-        max_length=2000, 
-        required=False,
-        placeholder="Kosongkan untuk tidak ada pesan (akan warning)"
-    )
-
-    def __init__(self, token_index: int, token_obj: dict):
-        super().__init__()
-        self.token_index = token_index
-        self.token_obj = token_obj
-        if token_obj.get("token_default_message"):
-            self.message.default = token_obj["token_default_message"]
-
-    async def on_submit(self, interaction: discord.Interaction):
-        new_msg = self.message.value.strip()
-        self.token_obj["token_default_message"] = new_msg if new_msg else None
-        save_tokens(tokens_config)
-        if self.token_obj.get("strict") and self.token_obj.get("active"):
-            for ch in self.token_obj.get("channels", []):
-                if ch.get("active"):
-                    await channel_manager.restart_channel_task(self.token_index, self.token_obj, ch["channel_id"])
-        await interaction.response.send_message(embed=success_embed("✅ Pesan default token diperbarui"), ephemeral=True)
-
-# ========== MODAL SET SCHEDULE ==========
-class SetScheduleModal(ui.Modal, title="Atur Jadwal Token"):
-    enabled = ui.TextInput(label="Aktifkan? (true/false)", placeholder="true atau false", required=True)
-    start = ui.TextInput(label="Jam mulai (HH:MM)", placeholder="08:00", required=False)
-    end = ui.TextInput(label="Jam selesai (HH:MM)", placeholder="22:00", required=False)
-
-    def __init__(self, token_index: int, token_obj: dict):
-        super().__init__()
-        self.token_index = token_index
-        self.token_obj = token_obj
-        sched = token_obj.get("schedule", {})
-        self.enabled.default = str(sched.get("enabled", False)).lower()
-        self.start.default = sched.get("start", "08:00")
-        self.end.default = sched.get("end", "22:00")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        enabled = self.enabled.value.strip().lower() == "true"
-        start = self.start.value.strip() or "08:00"
-        end = self.end.value.strip() or "22:00"
-        try:
-            datetime.strptime(start, "%H:%M")
-            datetime.strptime(end, "%H:%M")
-        except ValueError:
-            await interaction.response.send_message(embed=error_embed("❌ Format jam harus HH:MM"), ephemeral=True)
-            return
-        self.token_obj["schedule"] = {
-            "enabled": enabled,
-            "start": start,
-            "end": end
-        }
-        save_tokens(tokens_config)
-        await interaction.response.send_message(embed=success_embed("✅ Jadwal diperbarui"), ephemeral=True)
-
-# ========== MODAL ADD CHANNEL ==========
-class AddChannelModal(ui.Modal, title="Tambah Channel"):
-    channel_id = ui.TextInput(label="Channel ID", placeholder="Masukkan ID channel Discord")
-    delay = ui.TextInput(label="Delay (detik)", placeholder="Kosongkan untuk default (30 menit)", required=False)
-
-    def __init__(self, token_index: int, token_obj: dict):
-        super().__init__()
-        self.token_index = token_index
-        self.token_obj = token_obj
-
-    async def on_submit(self, interaction: discord.Interaction):
-        ch_id = self.channel_id.value.strip()
-        for ch in self.token_obj.get("channels", []):
-            if ch["channel_id"] == ch_id:
-                await interaction.response.send_message(embed=error_embed("❌ Channel sudah terdaftar"), ephemeral=True)
-                return
-        delay = int(self.delay.value) if self.delay.value and self.delay.value.isdigit() else config["default_delay"]
-        channel_data = {
-            "channel_id": ch_id,
-            "active": False,
-            "delay": delay,
-            "custom_message": None,
-            "last_sent": None,
-            "last_error": None,
-            "consecutive_errors": 0,
-            "stats": {
-                "messages_sent": 0,
-                "messages_failed": 0
-            }
-        }
-        if "channels" not in self.token_obj:
-            self.token_obj["channels"] = []
-        self.token_obj["channels"].append(channel_data)
-        save_tokens(tokens_config)
-
-        if self.token_obj.get("active") and channel_data.get("last_error") is None:
-            channel_data["active"] = True
-            save_tokens(tokens_config)
-            await channel_manager.start_channel_task(self.token_index, self.token_obj, ch_id)
-
-        embed = success_embed("✅ Channel ditambahkan", f"<#{ch_id}>")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ========== REMOVE CHANNEL VIEW ==========
-class RemoveChannelView(ui.View):
-    def __init__(self, token_index: int, token_obj: dict):
-        super().__init__(timeout=60)
-        self.token_index = token_index
-        self.token_obj = token_obj
-        self.add_item(RemoveChannelSelect(token_index, token_obj))
-
-class RemoveChannelSelect(ui.Select):
-    def __init__(self, token_index: int, token_obj: dict):
-        self.token_index = token_index
-        self.token_obj = token_obj
-        options = []
-        for ch in token_obj.get("channels", [])[:25]:
-            label = f"{ch['channel_id'][:8]}... (delay {ch['delay']}s)"
-            options.append(discord.SelectOption(label=label, value=ch["channel_id"]))
-        super().__init__(placeholder="Pilih channel", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        ch_id = self.values[0]
-        await channel_manager.stop_channel_task(self.token_index, ch_id)
-        self.token_obj["channels"] = [ch for ch in self.token_obj["channels"] if ch["channel_id"] != ch_id]
-        save_tokens(tokens_config)
-        embed = success_embed("🗑 Channel dihapus")
-        await interaction.response.edit_message(embed=embed, view=None)
-
-# ========== SET CUSTOM MESSAGE VIEW ==========
-class SelectChannelForMessageView(ui.View):
-    def __init__(self, token_index: int, token_obj: dict):
-        super().__init__(timeout=60)
-        self.token_index = token_index
-        self.token_obj = token_obj
-        self.add_item(ChannelForMessageSelect(token_index, token_obj))
-
-class ChannelForMessageSelect(ui.Select):
-    def __init__(self, token_index: int, token_obj: dict):
-        self.token_index = token_index
-        self.token_obj = token_obj
-        options = []
-        for ch in token_obj.get("channels", [])[:25]:
-            custom = ch.get("custom_message")
-            display = (custom[:20] + "...") if custom else "Default"
-            label = f"{ch['channel_id'][:8]}... - {display}"
-            options.append(discord.SelectOption(label=label, value=ch["channel_id"]))
-        super().__init__(placeholder="Pilih channel", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        ch_id = self.values[0]
-        modal = SetCustomMessageModal(self.token_index, self.token_obj, ch_id)
-        await interaction.response.send_modal(modal)
-
-class SetCustomMessageModal(ui.Modal, title="Custom Message"):
-    message = ui.TextInput(
-        label="Pesan custom", 
-        style=discord.TextStyle.paragraph, 
-        max_length=2000,
-        required=False,
-        placeholder="Kosongkan untuk menggunakan pesan default token"
-    )
-
-    def __init__(self, token_index: int, token_obj: dict, channel_id: str):
-        super().__init__()
-        self.token_index = token_index
-        self.token_obj = token_obj
-        self.channel_id = channel_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        for ch in self.token_obj["channels"]:
-            if ch["channel_id"] == self.channel_id:
-                ch["custom_message"] = self.message.value.strip() or None
-                save_tokens(tokens_config)
-                if ch.get("active"):
-                    await channel_manager.restart_channel_task(self.token_index, self.token_obj, self.channel_id)
-                await interaction.response.send_message(embed=success_embed("✅ Pesan custom disimpan"), ephemeral=True)
-                return
-        await interaction.response.send_message(embed=error_embed("❌ Channel tidak ditemukan"), ephemeral=True)
-
-# ========== SLASH COMMANDS ==========
-@bot.tree.command(name="dashboard", description="Tampilkan dashboard utama")
-@owner_only()
-async def dashboard(interaction: discord.Interaction):
-    await interaction.response.defer()
-    embed = build_main_dashboard_embed()
-    view = MainDashboardView()
-    await interaction.followup.send(embed=embed, view=view)
-    msg = await interaction.original_response()
-    dashboard_manager.add_dashboard(interaction.user.id, interaction.channel_id, msg.id, view)
-
-@bot.tree.command(name="set_default", description="Atur delay default global")
-@app_commands.describe(delay="Delay dalam detik (min 60)")
-@owner_only()
-async def set_default(interaction: discord.Interaction, delay: int):
-    if delay < 60:
-        await interaction.response.send_message(embed=error_embed("Delay minimal 60"), ephemeral=True)
-        return
-    config["default_delay"] = delay
-    save_config(config)
-    await interaction.response.send_message(embed=success_embed("⚙️ Delay global diperbarui", f"{delay} detik"), ephemeral=True)
-
-# ========== ON_READY ==========
-@bot.event
-async def on_ready():
-    logger.info(f'{bot.user} has connected to Discord!')
-    await bot.tree.sync()
-    for idx, token_obj in enumerate(tokens_config.get("tokens", [])):
-        if token_obj.get("active"):
-            await channel_manager.start_all_token_channels(idx, token_obj)
-            await asyncio.sleep(1)
-    owner = await bot.fetch_user(OWNER_ID)
-    print(f"\n👑 Bot Owner: {owner.name}#{owner.discriminator} (ID: {OWNER_ID})")
-    print("✅ Dashboard siap – auto-refresh 5s, schedule check tiap menit, auto-remove error channel\n")
-
-# ========== ERROR HANDLING ==========
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        await ctx.send(embed=info_embed("❓ Command tidak dikenal", f"Gunakan slash command `/dashboard`."))
-    else:
-        logger.error(f"Prefix command error: {error}")
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        return
-    logger.error(f"Slash command error: {error}")
-    embed = error_embed("❌ Terjadi Error", f"```{error}```")
-    try:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    except:
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-# ========== MAIN ==========
-if __name__ == "__main__":
-    if not os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE, 'w') as f:
-            json.dump({"tokens": []}, f, indent=2)
-    if not os.path.exists(CONFIG_FILE):
-        save_config(config)
-
-    import sys
-    if len(sys.argv) > 1:
-        bot_token = sys.argv[1]
-    else:
-        print("="*60)
-        print("🤖 DISCORD BOT - MULTI TOKEN DASHBOARD (FINAL+)")
-        print("="*60)
-        print(f"\n👑 Owner ID: {OWNER_ID}")
-        print("\nMasukkan token bot utama:")
-        bot_token = input("Token: ").strip()
-    if not bot_token:
-        logger.error("Token required!")
-        sys.exit(1)
-    try:
-        bot.run(bot_token)
-    except discord.LoginFailure:
-        logger.error("Token tidak valid")
-        print("❌ Token bot tidak valid!")
-    except KeyboardInterrupt:
-        logger.info("Bot dihentikan user")
-        print("\n👋 Bot berhenti")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        print(f"❌ Error: {e}")
+    # Nama file berdasarkan URL (untuk disimpan sementara)
+    filename=$(basename "$url")
+    downloaded_file="$TEMP_DIR/$filename"
+
+    echo "========================================="
+    echo "Memproses: $pkg"
+    echo "URL: $url"
+    echo "========================================="
+
+    # 1. Uninstall paket (abaikan error jika tidak terinstall)
+    echo "Menghapus $pkg ..."
+    pm uninstall "$pkg" > /dev/null 2>&1
+    sleep 1
+
+    # 2. Download file
+    echo "Mendownload file..."
+    curl -L -o "$downloaded_file" "$url"
+    if [ $? -ne 0 ] || [ ! -f "$downloaded_file" ]; then
+        echo "Error: Gagal mendownload file. Lewati package ini."
+        continue
+    fi
+    echo "Download selesai: $downloaded_file"
+
+    # 3. Proses file: jika ZIP, ekstrak dan cari APK
+    apk_file=""
+    if [[ "$filename" == *.zip ]]; then
+        echo "File ZIP terdeteksi. Mengekstrak..."
+        extract_dir="$TEMP_DIR/extracted_$pkg"
+        mkdir -p "$extract_dir"
+        unzip -o "$downloaded_file" -d "$extract_dir" > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "Error: Gagal mengekstrak ZIP."
+            rm -f "$downloaded_file"
+            continue
+        fi
+
+        # Cari file APK pertama di dalam folder hasil ekstraksi
+        apk_file=$(find "$extract_dir" -name "*.apk" -type f | head -n 1)
+        if [ -z "$apk_file" ]; then
+            echo "Error: Tidak ditemukan file APK di dalam ZIP."
+            rm -rf "$extract_dir" "$downloaded_file"
+            continue
+        else
+            echo "Ditemukan APK: $apk_file"
+        fi
+    else
+        # Jika bukan ZIP, asumsikan langsung APK
+        apk_file="$downloaded_file"
+    fi
+
+    # 4. Install APK
+    echo "Menginstall $pkg dari $apk_file ..."
+    pm install -r "$apk_file" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Error: Gagal menginstall $pkg"
+        # Bersihkan file sementara
+        rm -f "$downloaded_file"
+        [ -d "$extract_dir" ] && rm -rf "$extract_dir"
+        continue
+    fi
+
+    # 5. Buka aplikasi untuk inisialisasi data
+    open_app "$pkg"
+
+    # 6. Tunggu 10 detik
+    echo "Menunggu 10 detik..."
+    sleep 10
+
+    # 7. Bersihkan semua file sementara
+    rm -f "$downloaded_file"
+    [ -d "$extract_dir" ] && rm -rf "$extract_dir"
+
+    echo "Selesai untuk $pkg"
+    echo ""
+done
+
+echo "Semua proses selesai."
