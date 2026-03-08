@@ -1,11 +1,11 @@
 #!/bin/bash
 # =============================================================================
 # 🎯 GITHUB RELEASE INSTALLER (Vulik/Jawa - Tag: Hai)
-# 📦 Versi: 2.3 - Alur Matang & Robust
+# 📦 Versi: 2.4 - Progress bar rapi & stabil
 # 🔧 Fitur: Pilih file 1/2/3 atau A (semua), instal otomatis, hapus temp, trap sempurna
 # =============================================================================
 
-VERSION="2.3"
+VERSION="2.4"
 
 # =============================================================================
 # 1. CEK LINGKUNGAN
@@ -102,12 +102,12 @@ download_and_install() {
     echo -e "${C}[*] Mengunduh: ${W}$filename${N}"
     rm -f "$output"
 
-    # Download dengan curl di background, simpan PID
-    curl -L -# -o "$output" "$url" 2>&1 &
+    # Download dengan curl dalam mode silent (tidak ada output), jalankan di background
+    curl -L -s -o "$output" "$url" &
     local pid=$!
     DOWNLOAD_PIDS+=("$pid")
 
-    # Progress bar sederhana (update tiap 0.3 detik)
+    # Progress bar buatan sendiri (naik 5% tiap 0.3 detik)
     local progress=0
     while kill -0 $pid 2>/dev/null; do
         progress=$((progress + 5))
