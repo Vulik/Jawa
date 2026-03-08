@@ -1,130 +1,165 @@
 #!/bin/bash
-# ============================================================
-# Script otomatisasi pemeliharaan aplikasi untuk Android (Root)
-# Versi: Mendukung file ZIP yang berisi APK
-# Dependensi: curl, unzip (install di Termux: pkg install curl unzip)
-# ============================================================
+# ═══════════════════════════════════════════════════════════
+# 🎯 GITHUB RELEASE DOWNLOADER (Vulik/Jawa - Tag: Hai)
+# 📦 Versi: 1.0 - Khusus Satu Release
+# 🔧 Fitur: Pilih file 1/2/3 atau ALL
+# ═══════════════════════════════════════════════════════════
 
-# Pastikan script dijalankan sebagai root
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Error: Script harus dijalankan sebagai root."
-    echo "Gunakan: su -c \"bash $0\""
-    exit 1
-fi
+D="$HOME/downloads_jawa"; mkdir -p "$D"
+G='\e[1;32m'; B='\e[1;34m'; Y='\e[1;33m'; C='\e[1;36m'; R='\e[1;31m'; M='\e[1;35m'; W='\e[1;37m'; BD='\e[1m'; N='\e[0m'
 
-# ========== KONFIGURASI (UBAH SESUAI KEBUTUHAN) ==========
-# Daftar package name (harus sesuai dengan yang terinstall di sistem)
-packages=(
-    "com.example.app1"
-    "com.example.app2"
-    "com.example.app3"
-)
-
-# Daftar URL download (bisa langsung APK atau ZIP)
-# Pastikan urutannya sama dengan array packages
-urls=(
- "https://github.com/Vulik/Jawa/releases/download/Hai/HI.zip"   # ZIP berisi APK
-)
-
-# Direktori sementara (harus writable oleh root)
-TEMP_DIR="/data/local/tmp"
-# ============================================================
-
-# Fungsi untuk membuka aplikasi menggunakan monkey (fallback ke am start)
-open_app() {
-    local pkg="$1"
-    echo "Membuka aplikasi $pkg ..."
-    # Coba dengan monkey (paling sederhana)
-    monkey -p "$pkg" 1 > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "Peringatan: Gagal membuka $pkg dengan monkey. Coba metode alternatif..."
-        # Alternatif: buka dengan intent launcher (memerlukan activity utama, mungkin berhasil)
-        am start -p "$pkg" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER > /dev/null 2>&1
+# ═══════════════════════════════════════════════════════════
+# 🛠️  CEK DEPENDENSI
+# ═══════════════════════════════════════════════════════════
+check_deps() {
+    if ! command -v jq &>/dev/null; then
+        echo -e "${Y}⚠️  jq tidak ditemukan. Menginstall...${N}"
+        pkg install jq -y 2>/dev/null || apt install jq -y 2>/dev/null
+    fi
+    if ! command -v curl &>/dev/null; then
+        echo -e "${Y}⚠️  curl tidak ditemukan. Menginstall...${N}"
+        pkg install curl -y 2>/dev/null || apt install curl -y 2>/dev/null
     fi
 }
 
-# Pastikan direktori temp ada
-mkdir -p "$TEMP_DIR"
-
-# Loop berdasarkan indeks array packages
-for i in "${!packages[@]}"; do
-    pkg="${packages[$i]}"
-    url="${urls[$i]}"
+# ═══════════════════════════════════════════════════════════
+# 📦 AMBIL DATA ASSET DARI RELEASE "Hai"
+# ═══════════════════════════════════════════════════════════
+fetch_assets() {
+    local repo="Vulik/Jawa"
+    local tag="Hai"
+    local api_url="https://api.github.com/repos/$repo/releases/tags/$tag"
     
-    # Nama file berdasarkan URL (untuk disimpan sementara)
-    filename=$(basename "$url")
-    downloaded_file="$TEMP_DIR/$filename"
-
-    echo "========================================="
-    echo "Memproses: $pkg"
-    echo "URL: $url"
-    echo "========================================="
-
-    # 1. Uninstall paket (abaikan error jika tidak terinstall)
-    echo "Menghapus $pkg ..."
-    pm uninstall "$pkg" > /dev/null 2>&1
-    sleep 1
-
-    # 2. Download file
-    echo "Mendownload file..."
-    curl -L -o "$downloaded_file" "$url"
-    if [ $? -ne 0 ] || [ ! -f "$downloaded_file" ]; then
-        echo "Error: Gagal mendownload file. Lewati package ini."
-        continue
+    echo -e "${Y}🔍 Mengambil data dari release 'Hai'...${N}"
+    release_data=$(curl -s "$api_url")
+    
+    # Cek apakah release ditemukan
+    if echo "$release_data" | jq -e '.message' >/dev/null 2>&1; then
+        echo -e "${R}❌ Release 'Hai' tidak ditemukan atau repository tidak bisa diakses.${N}"
+        echo -e "${Y}Pesan: $(echo "$release_data" | jq -r '.message')${N}"
+        return 1
     fi
-    echo "Download selesai: $downloaded_file"
+    
+    # Ambil nama dan url aset
+    mapfile -t asset_names < <(echo "$release_data" | jq -r '.assets[]?.name')
+    mapfile -t asset_urls < <(echo "$release_data" | jq -r '.assets[]?.browser_download_url')
+    
+    if [ ${#asset_names[@]} -eq 0 ]; then
+        echo -e "${R}❌ Tidak ada file aset (assets) pada release ini.${N}"
+        return 1
+    fi
+    
+    echo -e "${G}✅ Ditemukan ${#asset_names[@]} file pada release 'Hai'.${N}"
+}
 
-    # 3. Proses file: jika ZIP, ekstrak dan cari APK
-    apk_file=""
-    if [[ "$filename" == *.zip ]]; then
-        echo "File ZIP terdeteksi. Mengekstrak..."
-        extract_dir="$TEMP_DIR/extracted_$pkg"
-        mkdir -p "$extract_dir"
-        unzip -o "$downloaded_file" -d "$extract_dir" > /dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            echo "Error: Gagal mengekstrak ZIP."
-            rm -f "$downloaded_file"
-            continue
-        fi
-
-        # Cari file APK pertama di dalam folder hasil ekstraksi
-        apk_file=$(find "$extract_dir" -name "*.apk" -type f | head -n 1)
-        if [ -z "$apk_file" ]; then
-            echo "Error: Tidak ditemukan file APK di dalam ZIP."
-            rm -rf "$extract_dir" "$downloaded_file"
-            continue
-        else
-            echo "Ditemukan APK: $apk_file"
-        fi
+# ═══════════════════════════════════════════════════════════
+# ⏬ FUNGSI DOWNLOAD (dengan progress bar)
+# ═══════════════════════════════════════════════════════════
+download_file() {
+    local url="$1"
+    local filename="$2"
+    local output="$D/$filename"
+    
+    echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "${C}[*] Mengunduh: ${W}$filename${N}"
+    rm -f "$output"
+    
+    # Unduh dengan curl, tampilkan progress bar sederhana
+    curl -L -# -o "$output" "$url" 2>&1 &
+    local pid=$!
+    
+    # Progress bar ala script sebelumnya
+    local progress=0
+    while kill -0 $pid 2>/dev/null; do
+        progress=$((progress + 5))
+        [ $progress -gt 95 ] && progress=98
+        local filled=$((progress / 5))
+        local bar=$(printf "%${filled}s" | tr ' ' '█')
+        local empty=$((20 - filled))
+        echo -ne "\r${B}    [${C}${bar}${N}${B}$(printf "%${empty}s" | tr ' ' '-')] ${W}${progress}%${N}"
+        sleep 0.3
+    done
+    echo -ne "\r${B}    [${C}████████████████████${N}${B}] ${W}100%${N}\n"
+    
+    if [ -f "$output" ] && [ -s "$output" ]; then
+        echo -e "${G}✅ Selesai: ${B}$output${N}"
     else
-        # Jika bukan ZIP, asumsikan langsung APK
-        apk_file="$downloaded_file"
+        echo -e "${R}❌ Gagal mengunduh $filename${N}"
     fi
+}
 
-    # 4. Install APK
-    echo "Menginstall $pkg dari $apk_file ..."
-    pm install -r "$apk_file" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "Error: Gagal menginstall $pkg"
-        # Bersihkan file sementara
-        rm -f "$downloaded_file"
-        [ -d "$extract_dir" ] && rm -rf "$extract_dir"
-        continue
-    fi
+# ═══════════════════════════════════════════════════════════
+# 🎯 MENU PILIHAN
+# ═══════════════════════════════════════════════════════════
+show_menu() {
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "${W}${BD}   FILE TERSEDIA DI RELEASE 'Hai'${N}"
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    
+    for i in "${!asset_names[@]}"; do
+        echo -e "${B}  [$((i+1))] ${W}${asset_names[$i]}${N}"
+    done
+    
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "${Y}  [A] Download SEMUA file sekaligus${N}"
+    echo -e "${W}  [0] Keluar${N}"
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    read -p "Pilih opsi (contoh: 1,2,3 atau A): " choice
+}
 
-    # 5. Buka aplikasi untuk inisialisasi data
-    open_app "$pkg"
+# ═══════════════════════════════════════════════════════════
+# 🚀 FUNGSI UTAMA
+# ═══════════════════════════════════════════════════════════
+main() {
+    check_deps
+    fetch_assets || return 1
+    
+    while true; do
+        show_menu
+        
+        case "$choice" in
+            0)
+                echo -e "${G}Bye!${N}"
+                exit 0
+                ;;
+            [Aa])
+                echo -e "${Y}📥 Mendownload SEMUA file...${N}"
+                for i in "${!asset_urls[@]}"; do
+                    download_file "${asset_urls[$i]}" "${asset_names[$i]}"
+                done
+                break
+                ;;
+            *)
+                # Cek apakah input berupa angka atau rentang (1,2,3)
+                selected=()
+                for num in $(echo "$choice" | tr ',' ' '); do
+                    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#asset_names[@]}" ]; then
+                        selected+=($((num-1)))
+                    fi
+                done
+                
+                if [ ${#selected[@]} -eq 0 ]; then
+                    echo -e "${R}Pilihan tidak valid!${N}"
+                    sleep 1
+                    continue
+                fi
+                
+                echo -e "${Y}📥 Mendownload ${#selected[@]} file...${N}"
+                for idx in "${selected[@]}"; do
+                    download_file "${asset_urls[$idx]}" "${asset_names[$idx]}"
+                done
+                break
+                ;;
+        esac
+    done
+    
+    echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "${G}✅ Semua unduhan selesai! File tersimpan di:${N}"
+    echo -e "${B}   $D${N}"
+    echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+}
 
-    # 6. Tunggu 10 detik
-    echo "Menunggu 10 detik..."
-    sleep 10
-
-    # 7. Bersihkan semua file sementara
-    rm -f "$downloaded_file"
-    [ -d "$extract_dir" ] && rm -rf "$extract_dir"
-
-    echo "Selesai untuk $pkg"
-    echo ""
-done
-
-echo "Semua proses selesai."
+# ═══════════════════════════════════════════════════════════
+# 🏁 EKSEKUSI
+# ═══════════════════════════════════════════════════════════
+main "$@"
