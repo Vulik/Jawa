@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
 # 🎯 GITHUB RELEASE INSTALLER (Vulik/Jawa - Tag: Hai)
-# 📦 Versi: 2.0 - Download + Install + Auto Cleanup
+# 📦 Versi: 2.1 - Fix permission temp dir
 # 🔧 Fitur: Pilih file 1/2/3 atau ALL, instal otomatis, hapus temp
 # ═══════════════════════════════════════════════════════════
 
-# Direktori temp (gunakan folder dengan akses tulis, misal /data/local/tmp)
-TEMP_DIR="/data/local/tmp/roblox_installer"
+# Direktori temp di home (tidak perlu root)
+TEMP_DIR="$HOME/roblox_installer"
 mkdir -p "$TEMP_DIR"
 
 # Warna
@@ -23,7 +23,7 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # Cek root
 if [ "$(id -u)" -ne 0 ] && ! command -v su &>/dev/null; then
-    echo -e "${R}[ERROR] Script ini butuh akses root!${N}"
+    echo -e "${R}[ERROR] Script ini butuh akses root untuk instalasi!${N}"
     exit 1
 fi
 
