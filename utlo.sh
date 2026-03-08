@@ -1,12 +1,33 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# 🎯 GITHUB RELEASE DOWNLOADER (Vulik/Jawa - Tag: Hai)
-# 📦 Versi: 1.1 - Fix input loop
+# 🎯 GITHUB RELEASE INSTALLER (Vulik/Jawa - Tag: Hai)
+# 📦 Versi: 2.0 - Download + Install + Auto Cleanup
+# 🔧 Fitur: Pilih file 1/2/3 atau ALL, instal otomatis, hapus temp
 # ═══════════════════════════════════════════════════════════
 
-D="$HOME/downloads_jawa"; mkdir -p "$D"
+# Direktori temp (gunakan folder dengan akses tulis, misal /data/local/tmp)
+TEMP_DIR="/data/local/tmp/roblox_installer"
+mkdir -p "$TEMP_DIR"
+
+# Warna
 G='\e[1;32m'; B='\e[1;34m'; Y='\e[1;33m'; C='\e[1;36m'; R='\e[1;31m'; M='\e[1;35m'; W='\e[1;37m'; BD='\e[1m'; N='\e[0m'
 
+# Trap untuk membersihkan temp jika script dihentikan (Ctrl+C, dll)
+cleanup() {
+    echo -e "\n${Y}⚠️  Membersihkan file sementara...${N}"
+    rm -rf "$TEMP_DIR"/*
+    echo -e "${G}✅ Selesai.${N}"
+    exit 0
+}
+trap cleanup SIGINT SIGTERM EXIT
+
+# Cek root
+if [ "$(id -u)" -ne 0 ] && ! command -v su &>/dev/null; then
+    echo -e "${R}[ERROR] Script ini butuh akses root!${N}"
+    exit 1
+fi
+
+# Cek dependensi
 check_deps() {
     if ! command -v jq &>/dev/null; then
         echo -e "${Y}⚠️  jq tidak ditemukan. Menginstall...${N}"
@@ -18,6 +39,7 @@ check_deps() {
     fi
 }
 
+# Ambil data aset dari release "Hai"
 fetch_assets() {
     local repo="Vulik/Jawa"
     local tag="Hai"
@@ -43,15 +65,17 @@ fetch_assets() {
     echo -e "${G}✅ Ditemukan ${#asset_names[@]} file pada release 'Hai'.${N}"
 }
 
-download_file() {
+# Fungsi download dan install
+download_and_install() {
     local url="$1"
     local filename="$2"
-    local output="$D/$filename"
+    local output="$TEMP_DIR/$filename"
 
     echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     echo -e "${C}[*] Mengunduh: ${W}$filename${N}"
     rm -f "$output"
 
+    # Download dengan progress bar
     curl -L -# -o "$output" "$url" 2>&1 &
     local pid=$!
 
@@ -67,13 +91,24 @@ download_file() {
     done
     echo -ne "\r${B}    [${C}████████████████████${N}${B}] ${W}100%${N}\n"
 
-    if [ -f "$output" ] && [ -s "$output" ]; then
-        echo -e "${G}✅ Selesai: ${B}$output${N}"
-    else
+    if [ ! -f "$output" ] || [ ! -s "$output" ]; then
         echo -e "${R}❌ Gagal mengunduh $filename${N}"
+        return 1
+    fi
+
+    echo -e "${Y}📦 Menginstal $filename...${N}"
+    # Instal dengan root
+    if su -c "pm install -r -d -g \"$output\"" </dev/null >/dev/null 2>&1; then
+        echo -e "${G}✅ Instalasi sukses!${N}"
+        rm -f "$output"
+        echo -e "${Y}🗑️  File sementara dihapus.${N}"
+    else
+        echo -e "${R}❌ Instalasi gagal! File tetap disimpan di $output${N}"
+        # Tidak hapus agar bisa dicoba manual
     fi
 }
 
+# Menu pilihan
 show_menu() {
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     echo -e "${W}${BD}   FILE TERSEDIA DI RELEASE 'Hai'${N}"
@@ -84,12 +119,13 @@ show_menu() {
     done
 
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-    echo -e "${Y}  [A] Download SEMUA file sekaligus${N}"
+    echo -e "${Y}  [A] Download & Install SEMUA file sekaligus${N}"
     echo -e "${W}  [0] Keluar${N}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     read -p "Pilih opsi (contoh: 1,2,3 atau A): " choice
 }
 
+# Fungsi utama
 main() {
     check_deps
     fetch_assets || return 1
@@ -97,7 +133,7 @@ main() {
     while true; do
         show_menu
 
-        # Bersihkan input dari carriage return dan spasi
+        # Bersihkan input
         choice=$(echo "$choice" | tr -d '\r' | xargs)
         if [[ -z "$choice" ]]; then
             echo -e "${Y}Input kosong, silakan masukkan pilihan.${N}"
@@ -108,12 +144,13 @@ main() {
         case "$choice" in
             0)
                 echo -e "${G}Bye!${N}"
+                cleanup
                 exit 0
                 ;;
             [Aa])
-                echo -e "${Y}📥 Mendownload SEMUA file...${N}"
+                echo -e "${Y}📥 Memproses SEMUA file...${N}"
                 for i in "${!asset_urls[@]}"; do
-                    download_file "${asset_urls[$i]}" "${asset_names[$i]}"
+                    download_and_install "${asset_urls[$i]}" "${asset_names[$i]}"
                 done
                 break
                 ;;
@@ -131,9 +168,9 @@ main() {
                     continue
                 fi
 
-                echo -e "${Y}📥 Mendownload ${#selected[@]} file...${N}"
+                echo -e "${Y}📥 Memproses ${#selected[@]} file...${N}"
                 for idx in "${selected[@]}"; do
-                    download_file "${asset_urls[$idx]}" "${asset_names[$idx]}"
+                    download_and_install "${asset_urls[$idx]}" "${asset_names[$idx]}"
                 done
                 break
                 ;;
@@ -141,9 +178,10 @@ main() {
     done
 
     echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-    echo -e "${G}✅ Semua unduhan selesai! File tersimpan di:${N}"
-    echo -e "${B}   $D${N}"
+    echo -e "${G}✅ Semua proses selesai!${N}"
     echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    cleanup  # Bersihkan temp (kalau masih ada file gagal, mungkin tetap ada)
 }
 
+# Jalankan main
 main "$@"
