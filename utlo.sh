@@ -1,22 +1,35 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
 # 🎯 GITHUB RELEASE INSTALLER (Vulik/Jawa - Tag: Hai)
-# 📦 Versi: 2.1 - Fix permission temp dir + Tampilkan Versi
+# 📦 Versi: 2.2 - Fix kill child processes on interrupt
 # 🔧 Fitur: Pilih file 1/2/3 atau ALL, instal otomatis, hapus temp
 # ═══════════════════════════════════════════════════════════
 
-VERSION="2.1"
+VERSION="2.2"
 
-# Direktori temp di home (tidak perlu root)
+# Direktori temp
 TEMP_DIR="$HOME/roblox_installer"
 mkdir -p "$TEMP_DIR"
 
 # Warna
 G='\e[1;32m'; B='\e[1;34m'; Y='\e[1;33m'; C='\e[1;36m'; R='\e[1;31m'; M='\e[1;35m'; W='\e[1;37m'; BD='\e[1m'; N='\e[0m'
 
-# Trap untuk membersihkan temp jika script dihentikan (Ctrl+C, dll)
+# Array untuk menyimpan PID proses download
+declare -a DOWNLOAD_PIDS=()
+
+# Fungsi cleanup yang ditingkatkan
 cleanup() {
-    echo -e "\n${Y}⚠️  Membersihkan file sementara...${N}"
+    echo -e "\n${Y}⚠️  Membersihkan dan menghentikan semua proses...${N}"
+    
+    # Hentikan semua proses download yang masih berjalan
+    for pid in "${DOWNLOAD_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+    done
+    
+    # Hapus file sementara
     rm -rf "$TEMP_DIR"/*
     echo -e "${G}✅ Selesai.${N}"
     exit 0
@@ -41,7 +54,7 @@ check_deps() {
     fi
 }
 
-# Ambil data aset dari release "Hai"
+# Ambil data aset
 fetch_assets() {
     local repo="Vulik/Jawa"
     local tag="Hai"
@@ -51,7 +64,7 @@ fetch_assets() {
     release_data=$(curl -s "$api_url")
 
     if echo "$release_data" | jq -e '.message' >/dev/null 2>&1; then
-        echo -e "${R}❌ Release 'Hai' tidak ditemukan atau repository tidak bisa diakses.${N}"
+        echo -e "${R}❌ Release 'Hai' tidak ditemukan.${N}"
         echo -e "${Y}Pesan: $(echo "$release_data" | jq -r '.message')${N}"
         return 1
     fi
@@ -60,11 +73,11 @@ fetch_assets() {
     mapfile -t asset_urls < <(echo "$release_data" | jq -r '.assets[]?.browser_download_url')
 
     if [ ${#asset_names[@]} -eq 0 ]; then
-        echo -e "${R}❌ Tidak ada file aset (assets) pada release ini.${N}"
+        echo -e "${R}❌ Tidak ada file aset.${N}"
         return 1
     fi
 
-    echo -e "${G}✅ Ditemukan ${#asset_names[@]} file pada release 'Hai'.${N}"
+    echo -e "${G}✅ Ditemukan ${#asset_names[@]} file.${N}"
 }
 
 # Fungsi download dan install
@@ -77,9 +90,10 @@ download_and_install() {
     echo -e "${C}[*] Mengunduh: ${W}$filename${N}"
     rm -f "$output"
 
-    # Download dengan progress bar
+    # Download dengan progress bar (background)
     curl -L -# -o "$output" "$url" 2>&1 &
     local pid=$!
+    DOWNLOAD_PIDS+=("$pid")  # Simpan PID untuk dibunuh nanti jika perlu
 
     local progress=0
     while kill -0 $pid 2>/dev/null; do
@@ -91,22 +105,25 @@ download_and_install() {
         echo -ne "\r${B}    [${C}${bar}${N}${B}$(printf "%${empty}s" | tr ' ' '-')] ${W}${progress}%${N}"
         sleep 0.3
     done
+    wait $pid  # Tunggu selesai dan dapatkan exit code
+    local curl_exit=$?
     echo -ne "\r${B}    [${C}████████████████████${N}${B}] ${W}100%${N}\n"
 
-    if [ ! -f "$output" ] || [ ! -s "$output" ]; then
+    # Hapus PID dari daftar setelah selesai
+    DOWNLOAD_PIDS=("${DOWNLOAD_PIDS[@]/$pid}")
+
+    if [ $curl_exit -ne 0 ] || [ ! -s "$output" ]; then
         echo -e "${R}❌ Gagal mengunduh $filename${N}"
         return 1
     fi
 
     echo -e "${Y}📦 Menginstal $filename...${N}"
-    # Instal dengan root
     if su -c "pm install -r -d -g \"$output\"" </dev/null >/dev/null 2>&1; then
         echo -e "${G}✅ Instalasi sukses!${N}"
         rm -f "$output"
         echo -e "${Y}🗑️  File sementara dihapus.${N}"
     else
         echo -e "${R}❌ Instalasi gagal! File tetap disimpan di $output${N}"
-        # Tidak hapus agar bisa dicoba manual
     fi
 }
 
@@ -139,7 +156,6 @@ main() {
     while true; do
         show_menu
 
-        # Bersihkan input
         choice=$(echo "$choice" | tr -d '\r' | xargs)
         if [[ -z "$choice" ]]; then
             echo -e "${Y}Input kosong, silakan masukkan pilihan.${N}"
@@ -186,8 +202,7 @@ main() {
     echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     echo -e "${G}✅ Semua proses selesai!${N}"
     echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-    cleanup  # Bersihkan temp (kalau masih ada file gagal, mungkin tetap ada)
+    cleanup
 }
 
-# Jalankan main
 main "$@"
