@@ -1,9 +1,11 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
 # 🎯 GITHUB RELEASE INSTALLER (Vulik/Jawa - Tag: Hai)
-# 📦 Versi: 2.1 - Fix permission temp dir
+# 📦 Versi: 2.1 - Fix permission temp dir + Tampilkan Versi
 # 🔧 Fitur: Pilih file 1/2/3 atau ALL, instal otomatis, hapus temp
 # ═══════════════════════════════════════════════════════════
+
+VERSION="2.1"
 
 # Direktori temp di home (tidak perlu root)
 TEMP_DIR="$HOME/roblox_installer"
@@ -127,6 +129,10 @@ show_menu() {
 
 # Fungsi utama
 main() {
+    clear
+    echo -e "${C}════════════════════════════════════════════════════${N}"
+    echo -e "${W}   GITHUB RELEASE INSTALLER v${VERSION}${N}"
+    echo -e "${C}════════════════════════════════════════════════════${N}"
     check_deps
     fetch_assets || return 1
 
